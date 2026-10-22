@@ -1,4 +1,5 @@
 import html
+import inspect
 import json
 import re
 import uuid
@@ -27,6 +28,20 @@ DIFFICULTY_SCORE = {
     "Medium": 2,
     "Hard": 3,
 }
+
+# Newer Streamlit versions replaced use_container_width=True with width="stretch".
+# This picks whichever the installed version supports, so the app runs on both.
+def _stretch_kwargs(func):
+    try:
+        if "width" in inspect.signature(func).parameters:
+            return {"width": "stretch"}
+    except (TypeError, ValueError):
+        pass
+    return {"use_container_width": True}
+
+
+BTN_STRETCH = _stretch_kwargs(st.button)
+FORM_BTN_STRETCH = _stretch_kwargs(st.form_submit_button)
 
 # ------------------------- DESIGN -------------------------
 
@@ -433,6 +448,9 @@ hr { border-color: var(--border); }
 [data-testid="stChatMessage"] p,
 [data-testid="stChatMessage"] li { color: var(--text); }
 [data-testid="stChatInput"] { border-radius: 14px; }
+.st-key-alexa_chat_form, .st-key-alexa_chat_form [data-testid="stForm"] {
+    border: none !important; padding: 0 !important; background: transparent !important;
+}
 
 /* ---------- Expander ---------- */
 [data-testid="stExpander"] {
@@ -1130,20 +1148,33 @@ with st.container(border=True):
 
     q1, q2, q3 = st.columns(3)
 
-    if q1.button("Plan my day", key="quick_plan", use_container_width=True):
+    if q1.button("Plan my day", key="quick_plan", **BTN_STRETCH):
         quick_message = f"I have {int(available_minutes)} minutes, what should I study?"
 
-    if q2.button("My progress", key="quick_progress", use_container_width=True):
+    if q2.button("My progress", key="quick_progress", **BTN_STRETCH):
         quick_message = "How is my progress?"
 
-    if q3.button("What's pending?", key="quick_pending", use_container_width=True):
+    if q3.button("What's pending?", key="quick_pending", **BTN_STRETCH):
         quick_message = "What's pending?"
 
     for role, message in st.session_state.chat[-8:]:
         with st.chat_message(role, avatar="🔷" if role == "assistant" else None):
             st.markdown(message if role == "assistant" else md_safe(message))
 
-    typed_message = st.chat_input("Ask Alexa+ about your study plan...")
+    with st.form("alexa_chat_form", clear_on_submit=True):
+        input_col, send_col = st.columns([6, 1])
+
+        with input_col:
+            typed_text = st.text_input(
+                "Message Alexa+",
+                placeholder="Ask Alexa+ about your study plan...",
+                label_visibility="collapsed",
+            )
+
+        with send_col:
+            sent = st.form_submit_button("Send", type="primary", **FORM_BTN_STRETCH)
+
+    typed_message = typed_text if sent else None
 
     chat_input_text = quick_message or typed_message
     if chat_input_text:
@@ -1191,7 +1222,7 @@ with st.container(border=True):
         submitted = st.form_submit_button(
             "Add study task",
             type="primary",
-            use_container_width=True,
+            **FORM_BTN_STRETCH,
         )
 
         if submitted:
@@ -1297,7 +1328,7 @@ else:
                     "Complete",
                     key=f"plan_done_{task['id']}",
                     type="primary",
-                    use_container_width=True,
+                    **BTN_STRETCH,
                 ):
                     mark_done(task)
                     if save_tasks():
@@ -1390,7 +1421,7 @@ else:
                 if st.button(
                     button_label,
                     key=f"toggle_{task['id']}",
-                    use_container_width=True,
+                    **BTN_STRETCH,
                 ):
                     if task["completed"]:
                         mark_undone(task)
