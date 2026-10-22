@@ -1,16 +1,16 @@
 import html
-import inspect
 import json
 import re
 import uuid
 from pathlib import Path
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # =========================================================
 # STUDYPILOT — ADAPTIVE STUDY PLANNER (Premium motion UI)
 # Rule-based planning + persistent local JSON storage
-# + simulated Alexa+ conversational assistant
+# + Alexa+ style voice assistant (browser speech, no API)
 # Requires Streamlit >= 1.39 (keyed containers)
 # =========================================================
 
@@ -28,20 +28,6 @@ DIFFICULTY_SCORE = {
     "Medium": 2,
     "Hard": 3,
 }
-
-# Newer Streamlit versions replaced use_container_width=True with width="stretch".
-# This picks whichever the installed version supports, so the app runs on both.
-def _stretch_kwargs(func):
-    try:
-        if "width" in inspect.signature(func).parameters:
-            return {"width": "stretch"}
-    except (TypeError, ValueError):
-        pass
-    return {"use_container_width": True}
-
-
-BTN_STRETCH = _stretch_kwargs(st.button)
-FORM_BTN_STRETCH = _stretch_kwargs(st.form_submit_button)
 
 # ------------------------- DESIGN -------------------------
 
@@ -438,20 +424,6 @@ hr { border-color: var(--border); }
 }
 [data-testid="stAlert"] * { color: var(--soft) !important; }
 
-/* ---------- Chat (Alexa+ assistant) ---------- */
-[data-testid="stChatMessage"] {
-    background: var(--surface-2);
-    border: 1px solid var(--border);
-    border-radius: 14px;
-    animation: fadeUp .4s var(--ease) both;
-}
-[data-testid="stChatMessage"] p,
-[data-testid="stChatMessage"] li { color: var(--text); }
-[data-testid="stChatInput"] { border-radius: 14px; }
-.st-key-alexa_chat_form, .st-key-alexa_chat_form [data-testid="stForm"] {
-    border: none !important; padding: 0 !important; background: transparent !important;
-}
-
 /* ---------- Expander ---------- */
 [data-testid="stExpander"] {
     background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
@@ -655,14 +627,6 @@ if "just_done" not in st.session_state:
 if "just_undone" not in st.session_state:
     st.session_state.just_undone = None
 
-# Alexa+ assistant conversation history: list of (role, message)
-if "chat" not in st.session_state:
-    st.session_state.chat = [(
-        "assistant",
-        "Hi, I'm your Alexa+ study assistant. Ask me for today's plan, "
-        "add a topic, or tell me what you've finished.",
-    )]
-
 
 CHECK_SVG = (
     '<svg viewBox="0 0 24 24" fill="none" stroke="#0D1226" stroke-width="3.5" '
@@ -731,303 +695,184 @@ def mark_undone(task):
     st.session_state.just_done = None
 
 
-# ------------------ ALEXA+ ASSISTANT LOGIC ----------------
-# CHAT-LOGIC-START
-# A small rule-based "natural language" layer. It understands a handful of
-# intents (plan, add, complete, undo, progress, pending) and calls the same
-# planner and storage functions that the dashboard uses.
+# -------------------- VOICE ASSISTANT ---------------------
 
-DURATION_RE = re.compile(
-    r"\b(?:for\s+)?(\d+(?:\.\d+)?)\s*(hours?|hrs?|h|minutes?|mins?|m)\b",
-    re.IGNORECASE,
-)
+if "voice_reply" not in st.session_state:
+    st.session_state.voice_reply = ""
+if "voice_speak" not in st.session_state:
+    st.session_state.voice_speak = ""
 
 
-def md_safe(text):
-    """Escape characters that would be read as Markdown formatting."""
-    return re.sub(r"([\\`*_{}\[\]<>#~|])", r"\\\1", str(text))
+def find_task_by_name(query):
+    q = query.lower().strip()
+    if not q:
+        return None
+    for t in st.session_state.tasks:
+        if t["name"].lower() == q:
+            return t
+    for t in st.session_state.tasks:
+        name = t["name"].lower()
+        if q in name or name in q:
+            return t
+    return None
 
 
-def extract_duration(text):
-    """Return (total_minutes_or_None, text_with_duration_phrases_removed)."""
-    total = 0.0
-    found = False
+def process_voice_command(text, minutes):
+    text = text.strip()
+    text = re.sub(r"^(hey\s+|ok\s+|okay\s+)?alexa[\s,.:!-]*", "", text, flags=re.I).strip()
+    low = text.lower().rstrip(".!?")
+    tasks = st.session_state.tasks
+    pending_tasks = [t for t in tasks if not t["completed"]]
 
-    for match in DURATION_RE.finditer(text):
-        found = True
-        value = float(match.group(1))
-        unit = match.group(2).lower()
-        total += value * 60 if unit.startswith("h") else value
+    if not low:
+        return "I'm listening. Try saying: what should I study?"
 
-    cleaned = DURATION_RE.sub(" ", text)
-    return (int(round(total)) if found else None), cleaned
+    # ADD
+    m = re.match(r"^(add|create|new)\s+(a\s+)?(task\s+|topic\s+)?(.+)$", text, flags=re.I)
+    if m:
+        rest = m.group(4)
+        duration = 30
+        hm = re.search(r"(\d+)\s*(hours?|hrs?)", rest, flags=re.I)
+        mm = re.search(r"(\d+)\s*(minutes?|mins?)", rest, flags=re.I)
+        if hm:
+            duration = int(hm.group(1)) * 60
+        if mm:
+            duration = (int(hm.group(1)) * 60 if hm else 0) + int(mm.group(1))
+        duration = min(300, max(5, duration))
 
+        difficulty = "Medium"
+        if re.search(r"\bhard\b|\bdifficult\b", rest, flags=re.I):
+            difficulty = "Hard"
+        elif re.search(r"\beasy\b", rest, flags=re.I):
+            difficulty = "Easy"
+        weak = bool(re.search(r"\bweak\b", rest, flags=re.I))
 
-def parse_minutes(text):
-    minutes, _ = extract_duration(text)
-    return minutes
+        name = re.sub(r"\d+\s*(hours?|hrs?|minutes?|mins?)", "", rest, flags=re.I)
+        name = re.sub(r"\b(for|and|as|is|weak|hard|difficult|easy|medium|topic|task)\b", "", name, flags=re.I)
+        name = re.sub(r"\s+", " ", name).strip(" ,.-")
+        if not name:
+            return "I didn't catch the topic name. Try: add Physics for 40 minutes, hard, weak."
+        name = name[0].upper() + name[1:]
 
+        st.session_state.tasks.append({
+            "id": str(uuid.uuid4()),
+            "name": name,
+            "duration": duration,
+            "difficulty": difficulty,
+            "weak": weak,
+            "completed": False,
+        })
+        save_tasks()
+        return (f"Added {name}, {duration} minutes, {difficulty.lower()} difficulty"
+                f"{', marked as weak' if weak else ''}.")
 
-def describe_task(task):
-    parts = [f"{task['duration']} min", task["difficulty"]]
-    if task["weak"]:
-        parts.append("weak topic")
-    return " · ".join(parts)
+    # COMPLETE
+    m = re.match(r"^(complete|completed|finish|finished|done with|mark done|mark)\s+(.+)$", text, flags=re.I)
+    if m:
+        target = re.sub(r"\s+(as\s+)?(done|complete|completed)$", "", m.group(2), flags=re.I)
+        task = find_task_by_name(target)
+        if not task:
+            return f"I couldn't find a task called {target}."
+        if task["completed"]:
+            return f"{task['name']} is already completed."
+        mark_done(task)
+        save_tasks()
+        return f"Nice work! {task['name']} is marked as completed."
 
-
-def extract_target(text):
-    """Strip filler words so only the task name the user mentioned remains."""
-    cleaned = text.lower().strip()
-    cleaned = re.sub(r"[?!.,;:]+$", "", cleaned)
-    cleaned = re.sub(
-        r"\b(?:please|alexa|mark|complete|completed|finish|finished|done|undo|"
-        r"reopen|re-open|unmark|as|pending|incomplete|undone|not|with|task|topic|"
-        r"the|i['’]ve|i['’]m|ive|i|have|just|my|is|it)\b",
-        " ",
-        cleaned,
-    )
-    return re.sub(r"\s+", " ", cleaned).strip()
-
-
-def find_task(target, completed):
-    """Find exactly one task by (partial) name among completed or pending ones."""
-    state = "completed" if completed else "pending"
-    pool = [t for t in st.session_state.tasks if t["completed"] == completed]
-
-    if not target:
-        return None, "Which task do you mean? Tell me its name, for example “complete Physics”."
-
-    exact = [t for t in pool if t["name"].lower() == target]
-    if len(exact) == 1:
-        return exact[0], None
-
-    partial = [t for t in pool if target in t["name"].lower()]
-    if not partial:
-        words = target.split()
-        partial = [t for t in pool if all(w in t["name"].lower() for w in words)]
-
-    if len(partial) == 1:
-        return partial[0], None
-
-    if len(partial) > 1:
-        names = ", ".join(md_safe(t["name"]) for t in partial[:5])
-        return None, f"That matches more than one task: {names}. Which one do you mean?"
-
-    return None, f"I couldn't find a {state} task matching “{md_safe(target)}”."
-
-
-def reply_add(text):
-    body = re.sub(
-        r"^\s*(?:please\s+)?(?:add|create|new)\b\s*(?:a\s+|an\s+|the\s+)?(?:new\s+)?"
-        r"(?:study\s+)?(?:(?:task|topic)\b)?\s*",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-
-    minutes, body = extract_duration(body)
-
-    difficulty = "Medium"
-    diff_match = re.search(
-        r"\b(easy|medium|hard|difficult)\b(?:\s+difficulty)?", body, re.IGNORECASE
-    )
-    if diff_match:
-        word = diff_match.group(1).lower()
-        difficulty = "Hard" if word == "difficult" else word.capitalize()
-        body = body[:diff_match.start()] + " " + body[diff_match.end():]
-
-    body, weak_count = re.subn(
-        r"\bweak\b(?:\s+(?:topic|subject|area))?", " ", body, flags=re.IGNORECASE
-    )
-    weak = weak_count > 0
-
-    name = re.sub(r"\s+", " ", body).strip(" ,.-:;—")
-    for _ in range(3):
-        name = re.sub(r"^(?:and|for|as|with|of|called|named)\s+", "", name, flags=re.IGNORECASE)
-        name = re.sub(r"\s+(?:and|for|as|with|is|a|an)$", "", name, flags=re.IGNORECASE)
-        name = name.strip(" ,.-:;—")
-
-    if not name:
-        return "What should I call it? Try: “add Physics 30 minutes hard weak”."
-
-    name = name[:80]
-    duration = max(5, min(300, minutes if minutes else 30))
-
-    st.session_state.tasks.append({
-        "id": str(uuid.uuid4()),
-        "name": name,
-        "duration": duration,
-        "difficulty": difficulty,
-        "weak": weak,
-        "completed": False,
-    })
-    save_tasks()
-
-    return (
-        f"Done. I added **{md_safe(name)}** — {duration} min, {difficulty}"
-        f"{', weak topic' if weak else ''}. "
-        "Ask me to plan your day to see where it ranks."
-    )
-
-
-def reply_complete(text, undo=False):
-    target = extract_target(text)
-    task, error = find_task(target, completed=undo)
-
-    if error:
-        return error
-
-    if undo:
+    # UNDO
+    m = re.match(r"^(undo|reopen|restore|unmark)\s+(.+)$", text, flags=re.I)
+    if m:
+        task = find_task_by_name(m.group(2))
+        if not task:
+            return f"I couldn't find a task called {m.group(2)}."
+        if not task["completed"]:
+            return f"{task['name']} is already pending."
         mark_undone(task)
         save_tasks()
-        return f"No problem. **{md_safe(task['name'])}** is back on your pending list."
+        return f"{task['name']} moved back to pending."
 
-    mark_done(task)
-    save_tasks()
-    left = sum(1 for t in st.session_state.tasks if not t["completed"])
+    # PLAN
+    if any(k in low for k in ("plan", "study next", "what should i study", "what do i study", "next")):
+        if not pending_tasks:
+            return "You're all caught up. Add a topic whenever you're ready."
+        scheduled, _, free = generate_plan(tasks, int(minutes))
+        if not scheduled:
+            return "None of your unfinished tasks fits the available time."
+        names = ", then ".join(t["name"] for t in scheduled[:5])
+        more = f", and {len(scheduled) - 5} more" if len(scheduled) > 5 else ""
+        return f"Your plan: {names}{more}. You'll have {free} minutes free."
 
-    if left == 0:
-        return f"Nice work! **{md_safe(task['name'])}** is complete — you're all caught up."
+    # TIME / STATUS
+    if any(k in low for k in ("how much", "time left", "pending", "remaining", "progress", "status")):
+        done = sum(t["completed"] for t in tasks)
+        mins = sum(t["duration"] for t in pending_tasks)
+        pct = int(100 * done / len(tasks)) if tasks else 0
+        return (f"You've completed {done} of {len(tasks)} tasks, {pct} percent. "
+                f"{len(pending_tasks)} remain, about {mins} minutes of study.")
 
-    return f"Nice work! **{md_safe(task['name'])}** is complete. {left} task(s) left."
-
-
-def reply_plan(text, default_minutes):
-    minutes = parse_minutes(text) or default_minutes
-    tasks = st.session_state.tasks
-    pending_now = [t for t in tasks if not t["completed"]]
-
-    if not tasks:
-        return "Your study list is empty. Try: “add Physics 30 minutes hard weak”."
-
-    if not pending_now:
-        return "You're all caught up — there's nothing pending. Add another topic whenever you're ready."
-
-    if minutes < 5:
-        return "Give me at least 5 minutes and I'll build a plan."
-
-    scheduled_now, skipped_now, free_now = generate_plan(tasks, minutes)
-
-    if not scheduled_now:
-        shortest = min(t["duration"] for t in pending_now)
-        return (
-            f"Nothing fits in {minutes} minutes — your shortest pending task needs "
-            f"{shortest}. Try a longer window or shorten a task."
-        )
-
-    lines = [
-        f"{i}. **{md_safe(t['name'])}** — {describe_task(t)}"
-        for i, t in enumerate(scheduled_now, start=1)
-    ]
-
-    extra = f" {len(skipped_now)} other task(s) didn't fit." if skipped_now else ""
-
-    return (
-        f"With **{minutes} minutes**, here's what I'd study:\n\n"
-        + "\n".join(lines)
-        + "\n\nWeak topics come first, then harder ones. "
-        + f"You'd have {free_now} min free.{extra}"
-    )
+    return ("I can help with: what should I study, add a task, complete a task, "
+            "undo a task, or how much time is left.")
 
 
-def reply_progress():
-    tasks = st.session_state.tasks
-
-    if not tasks:
-        return "Your study list is empty, so there's no progress yet."
-
-    done = sum(1 for t in tasks if t["completed"])
-    pending_now = [t for t in tasks if not t["completed"]]
-    minutes_left = sum(t["duration"] for t in pending_now)
-    rate = done / len(tasks)
-
-    return (
-        f"You've completed **{done} of {len(tasks)}** tasks ({rate:.0%}). "
-        f"{len(pending_now)} left, about {minutes_left} minutes of study."
-    )
+def handle_voice_command():
+    cmd = st.session_state.get("voice_input", "")
+    if cmd.strip():
+        reply = process_voice_command(cmd, st.session_state.get("available_minutes", 120))
+        st.session_state.voice_reply = reply
+        st.session_state.voice_speak = reply
+    st.session_state.voice_input = ""
 
 
-def reply_pending():
-    tasks = st.session_state.tasks
-    ranked, _, _ = generate_plan(tasks, 10**6)
-
-    if not ranked:
-        return "Nothing is pending right now. Nice and clear!"
-
-    lines = [
-        f"{i}. **{md_safe(t['name'])}** — {describe_task(t)}"
-        for i, t in enumerate(ranked[:8], start=1)
-    ]
-    more = f"\n\n…and {len(ranked) - 8} more." if len(ranked) > 8 else ""
-
-    return "Here's what's pending, highest priority first:\n\n" + "\n".join(lines) + more
-
-
-def reply_help():
-    return (
-        "I can help with:\n\n"
-        "1. **Planning** — “I have 90 minutes, what should I study?”\n"
-        "2. **Adding topics** — “add Physics 30 minutes hard weak”\n"
-        "3. **Completing** — “complete Physics”\n"
-        "4. **Undoing** — “undo Physics”\n"
-        "5. **Progress** — “how is my progress?” or “what's pending?”"
-    )
-
-
-def alexa_reply(text, default_minutes):
-    low = text.lower().strip()
-
-    if re.match(r"^(?:please\s+)?(?:add|create|new)\b", low):
-        return reply_add(text)
-
-    is_undo = bool(re.match(r"^(?:please\s+)?(?:undo|reopen|re-open|unmark)\b", low)) or (
-        bool(re.match(r"^(?:please\s+)?mark\b", low))
-        and bool(re.search(r"\b(?:pending|incomplete|undone|not done)\b", low))
-    )
-    if is_undo:
-        return reply_complete(text, undo=True)
-
-    is_complete = (
-        re.match(r"^(?:please\s+)?(?:complete|completed|finish|finished|done|mark)\b", low)
-        or re.match(r"^i(?:['’]ve|\s+have)?\s+(?:just\s+)?(?:completed|finished|done)\b", low)
-        or re.match(r"^i['’]m\s+done\b", low)
-    )
-    if is_complete:
-        return reply_complete(text)
-
-    if re.search(r"\b(?:progress|status|how am i|how many|how much|summary|stats)\b", low):
-        return reply_progress()
-
-    if re.search(
-        r"\b(?:pending|remaining|to do|todo|my tasks|task list|list|what['’]?s left)\b", low
-    ):
-        return reply_pending()
-
-    if re.search(
-        r"\b(?:plan|schedule|study|what next|what should|what do i|minutes?|mins?|hours?|hrs?|time)\b",
-        low,
-    ):
-        return reply_plan(text, default_minutes)
-
-    if re.search(r"\b(?:hi|hello|hey|help|what can you do)\b", low):
-        return reply_help()
-
-    return (
-        "I'm not sure I got that. Try “I have 60 minutes, what should I study?”, "
-        "“add Physics 30 minutes hard weak”, or say “help”."
-    )
+MIC_HTML = """
+<style>
+  body { margin:0; font-family:'DM Sans',sans-serif; }
+  #mic { width:100%; min-height:44px; border-radius:12px; border:1px solid #36407A;
+         background:transparent; color:#7C9BF5; font-weight:700; font-size:15px; cursor:pointer;
+         transition:all .3s ease; }
+  #mic:hover { background:#7C9BF5; color:#0D1226; }
+  #mic.on { background:#F5657A; border-color:#F5657A; color:#1A0D10; animation:pulse 1s infinite; }
+  #hint { color:#8189A3; font-size:12px; margin-top:6px; }
+  @keyframes pulse { 50% { box-shadow:0 0 0 8px rgba(245,101,122,.25); } }
+</style>
+<button id="mic">🎙  Tap and speak to Alexa</button>
+<div id="hint"></div>
+<script>
+const btn = document.getElementById('mic'), hint = document.getElementById('hint');
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+if (!SR) { btn.disabled = true; hint.textContent = 'Voice input needs Chrome or Edge. You can still type commands.'; }
+else {
+  const rec = new SR(); rec.lang = 'en-US'; rec.interimResults = false;
+  rec.onstart = () => { btn.classList.add('on'); btn.textContent = '● Listening...'; };
+  rec.onend = () => { btn.classList.remove('on'); btn.textContent = '🎙  Tap and speak to Alexa'; };
+  rec.onerror = (e) => { hint.textContent = 'Mic error: ' + e.error; };
+  rec.onresult = (e) => {
+    const text = e.results[0][0].transcript;
+    hint.textContent = 'Heard: "' + text + '"';
+    try {
+      const doc = window.parent.document;
+      const input = doc.querySelector('input[aria-label="Voice command"]');
+      const setter = Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, 'value').set;
+      setter.call(input, text);
+      input.dispatchEvent(new window.parent.Event('input', { bubbles: true }));
+      input.dispatchEvent(new window.parent.KeyboardEvent('keydown', { key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true }));
+      input.blur();
+    } catch (err) { hint.textContent = 'Could not send. Type the command instead: ' + text; }
+  };
+  btn.onclick = () => rec.start();
+}
+</script>
+"""
 
 
-def handle_chat(text, default_minutes):
-    text = text.strip()
-    if not text:
-        return
-
-    reply = alexa_reply(text, default_minutes)
-    st.session_state.chat.append(("user", text))
-    st.session_state.chat.append(("assistant", reply))
-    st.session_state.chat = st.session_state.chat[-30:]
-# CHAT-LOGIC-END
+def speak_html(text):
+    return f"""
+    <script>
+      const u = new SpeechSynthesisUtterance({json.dumps(text)});
+      u.rate = 1.0; u.pitch = 1.0;
+      window.speechSynthesis.cancel();
+      window.speechSynthesis.speak(u);
+    </script>
+    """
 
 
 # ------------------------- SIDEBAR ------------------------
@@ -1053,6 +898,7 @@ with st.sidebar:
         max_value=720,
         value=120,
         step=15,
+        key="available_minutes",
     )
 
     st.caption(
@@ -1068,7 +914,6 @@ with st.sidebar:
         <div class="side-step"><span class="n">2</span><div>Mark weak and difficult topics.</div></div>
         <div class="side-step"><span class="n">3</span><div>Follow your recommended plan.</div></div>
         <div class="side-step"><span class="n">4</span><div>Mark tasks complete to track progress.</div></div>
-        <div class="side-step"><span class="n">5</span><div>Or just talk to the Alexa+ assistant.</div></div>
         """,
         unsafe_allow_html=True,
     )
@@ -1076,7 +921,6 @@ with st.sidebar:
     st.divider()
     st.caption("Tasks are stored locally in tasks.json.")
     st.caption("Planning uses transparent rules, not an external AI service.")
-    st.caption("The Alexa+ assistant is a simulated conversational layer.")
 
 
 # ------------------------- DASHBOARD ----------------------
@@ -1133,53 +977,35 @@ if tasks:
 st.divider()
 
 
-# ---------------------- ALEXA+ ASSISTANT ------------------
+# ------------------- VOICE ASSISTANT UI -------------------
 
-st.markdown("## Ask Alexa+")
+st.markdown("## Alexa+ study assistant")
 st.markdown(
-    '<div class="section-note">A simulated Alexa+ conversation that uses the same planner '
-    'as the dashboard. Try "I have 90 minutes, what should I study?" or '
-    '"add Physics 30 minutes hard weak".</div>',
+    '<div class="section-note">Speak or type: "what should I study", '
+    '"add Physics for 40 minutes hard weak", "complete Physics", '
+    '"undo Physics", "how much time is left".</div>',
     unsafe_allow_html=True,
 )
 
-with st.container(border=True):
-    quick_message = None
+with st.container(border=True, key="card_voice"):
+    v1, v2 = st.columns([3, 1])
+    with v1:
+        st.text_input(
+            "Voice command",
+            key="voice_input",
+            placeholder="e.g. Alexa, what should I study?",
+            on_change=handle_voice_command,
+        )
+    with v2:
+        st.write("")
+        components.html(MIC_HTML, height=90)
 
-    q1, q2, q3 = st.columns(3)
+    if st.session_state.voice_reply:
+        st.info(f"🗣 {st.session_state.voice_reply}")
 
-    if q1.button("Plan my day", key="quick_plan", **BTN_STRETCH):
-        quick_message = f"I have {int(available_minutes)} minutes, what should I study?"
-
-    if q2.button("My progress", key="quick_progress", **BTN_STRETCH):
-        quick_message = "How is my progress?"
-
-    if q3.button("What's pending?", key="quick_pending", **BTN_STRETCH):
-        quick_message = "What's pending?"
-
-    for role, message in st.session_state.chat[-8:]:
-        with st.chat_message(role, avatar="🔷" if role == "assistant" else None):
-            st.markdown(message if role == "assistant" else md_safe(message))
-
-    with st.form("alexa_chat_form", clear_on_submit=True):
-        input_col, send_col = st.columns([6, 1])
-
-        with input_col:
-            typed_text = st.text_input(
-                "Message Alexa+",
-                placeholder="Ask Alexa+ about your study plan...",
-                label_visibility="collapsed",
-            )
-
-        with send_col:
-            sent = st.form_submit_button("Send", type="primary", **FORM_BTN_STRETCH)
-
-    typed_message = typed_text if sent else None
-
-    chat_input_text = quick_message or typed_message
-    if chat_input_text:
-        handle_chat(chat_input_text, int(available_minutes))
-        st.rerun()
+if st.session_state.voice_speak:
+    components.html(speak_html(st.session_state.voice_speak), height=0)
+    st.session_state.voice_speak = ""
 
 st.divider()
 
@@ -1222,7 +1048,7 @@ with st.container(border=True):
         submitted = st.form_submit_button(
             "Add study task",
             type="primary",
-            **FORM_BTN_STRETCH,
+            use_container_width=True,
         )
 
         if submitted:
@@ -1328,7 +1154,7 @@ else:
                     "Complete",
                     key=f"plan_done_{task['id']}",
                     type="primary",
-                    **BTN_STRETCH,
+                    use_container_width=True,
                 ):
                     mark_done(task)
                     if save_tasks():
@@ -1421,7 +1247,7 @@ else:
                 if st.button(
                     button_label,
                     key=f"toggle_{task['id']}",
-                    **BTN_STRETCH,
+                    use_container_width=True,
                 ):
                     if task["completed"]:
                         mark_undone(task)
